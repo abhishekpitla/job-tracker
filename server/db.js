@@ -20,6 +20,8 @@ db.exec(`
     salary_min INTEGER,
     salary_max INTEGER,
     notes TEXT,
+    priority INTEGER DEFAULT 0,
+    source TEXT,
     created_at TEXT DEFAULT (datetime('now')),
     updated_at TEXT DEFAULT (datetime('now'))
   );
@@ -58,6 +60,19 @@ db.exec(`
     practiced INTEGER DEFAULT 0,
     created_at TEXT DEFAULT (datetime('now'))
   );
+
+  CREATE TABLE IF NOT EXISTS activity_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id INTEGER NOT NULL,
+    type TEXT NOT NULL,
+    description TEXT NOT NULL,
+    created_at TEXT DEFAULT (datetime('now')),
+    FOREIGN KEY (job_id) REFERENCES jobs(id) ON DELETE CASCADE
+  );
 `);
+
+// Run migrations for existing DBs that may not have new columns yet
+try { db.exec(`ALTER TABLE jobs ADD COLUMN priority INTEGER DEFAULT 0`); } catch (_) { }
+try { db.exec(`ALTER TABLE jobs ADD COLUMN source TEXT`); } catch (_) { }
 
 module.exports = db;

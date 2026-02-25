@@ -1,12 +1,68 @@
+require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
+const { OpenAI } = require('openai');
 const db = require('./db');
 
+const openai = new OpenAI({
+  apiKey: process.env.OPENAI_API_KEY || 'fake-key-to-avoid-crash'
+});
+
 const app = express();
-app.use(cors());
+app.use(cors({ origin: '*' }));
 app.use(express.json());
 
 const PORT = 3001;
+
+// Helper: add an activity log entry
+function logActivity(job_id, type, description) {
+  db.prepare('INSERT INTO activity_log (job_id, type, description) VALUES (?, ?, ?)')
+    .run(job_id, type, description);
+}
+
+// ── AI ────────────────────────────────────────────────────────────────────────
+
+app.post('/api/ai/parse-job', async (req, res) => {
+  try {
+    const { text } = req.body;
+    if (!text) return res.status(400).json({ error: 'Text is required' });
+
+    if (!process.env.OPENAI_API_KEY) {
+      return res.status(500).json({ error: 'Please set your OPENAI_API_KEY in the server/.env file' });
+    }
+
+    const prompt = `
+Extract the following job application details from the text below and return ONLY a valid JSON object. 
+If a field is not found, leave it empty or null. Try to infer the location, remote status, salary min and max if mentioned.
+
+{
+  "company": "Company Name",
+  "position": "Job Title",
+  "location": "City, State or Remote",
+  "remote": boolean (true if remote is mentioned),
+  "salary_min": number (minimum salary if mentioned, else null),
+  "salary_max": number (maximum salary if mentioned, else null),
+  "notes": "Short summary of the role or requirements"
+}
+
+Text:
+${text}
+`;
+
+    const response = await openai.chat.completions.create({
+      model: 'gpt-4o-mini',
+      messages: [{ role: 'user', content: prompt }],
+      response_format: { type: 'json_object' }
+    });
+
+    const parsed = JSON.parse(response.choices[0].message.content);
+    res.json(parsed);
+
+  } catch (error) {
+    console.error('AI parse error:', error);
+    res.status(500).json({ error: 'Failed to parse job description. Is your API key valid?' });
+  }
+});
 
 // ── JOBS ──────────────────────────────────────────────────────────────────────
 
@@ -37,31 +93,98 @@ app.get('/api/jobs/:id', (req, res) => {
   const interviews = db.prepare(
     'SELECT * FROM interview_rounds WHERE job_id = ? ORDER BY scheduled_date'
   ).all(req.params.id);
-  res.json({ ...job, contacts, interviews });
+  const activity = db.prepare(
+    'SELECT * FROM activity_log WHERE job_id = ? ORDER BY created_at DESC LIMIT 50'
+  ).all(req.params.id);
+  res.json({ ...job, contacts, interviews, activity });
 });
 
 app.post('/api/jobs', (req, res) => {
-  const { company, position, location, remote, url, status, applied_date, deadline, salary_min, salary_max, notes } = req.body;
+  const {
+    company, position, location, remote, url, status,
+    applied_date, deadline, salary_min, salary_max, notes, priority, source
+  } = req.body;
+
   const result = db.prepare(`
-    INSERT INTO jobs (company, position, location, remote, url, status, applied_date, deadline, salary_min, salary_max, notes)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `).run(company, position, location, remote ? 1 : 0, url, status || 'applied', applied_date, deadline, salary_min || null, salary_max || null, notes);
-  res.status(201).json(db.prepare('SELECT * FROM jobs WHERE id = ?').get(result.lastInsertRowid));
+    INSERT INTO jobs (company, position, location, remote, url, status, applied_date, deadline,
+      salary_min, salary_max, notes, priority, source)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    company, position, location, remote ? 1 : 0, url,
+    status || 'applied', applied_date, deadline,
+    salary_min || null, salary_max || null, notes,
+    priority || 0, source || null
+  );
+
+  const newJob = db.prepare('SELECT * FROM jobs WHERE id = ?').get(result.lastInsertRowid);
+  logActivity(newJob.id, 'created', `Application created for ${company} — ${position}`);
+  if (applied_date) logActivity(newJob.id, 'applied', `Applied on ${applied_date}`);
+
+  res.status(201).json(newJob);
 });
 
 app.put('/api/jobs/:id', (req, res) => {
-  const { company, position, location, remote, url, status, applied_date, deadline, salary_min, salary_max, notes } = req.body;
+  const {
+    company, position, location, remote, url, status,
+    applied_date, deadline, salary_min, salary_max, notes, priority, source
+  } = req.body;
+
+  const oldJob = db.prepare('SELECT * FROM jobs WHERE id = ?').get(req.params.id);
+
   db.prepare(`
     UPDATE jobs SET company=?, position=?, location=?, remote=?, url=?, status=?,
-    applied_date=?, deadline=?, salary_min=?, salary_max=?, notes=?, updated_at=datetime('now')
+    applied_date=?, deadline=?, salary_min=?, salary_max=?, notes=?, priority=?, source=?,
+    updated_at=datetime('now')
     WHERE id=?
-  `).run(company, position, location, remote ? 1 : 0, url, status, applied_date, deadline, salary_min || null, salary_max || null, notes, req.params.id);
+  `).run(
+    company, position, location, remote ? 1 : 0, url, status,
+    applied_date, deadline, salary_min || null, salary_max || null, notes,
+    priority || 0, source || null,
+    req.params.id
+  );
+
+  // Auto-log status changes
+  if (oldJob && oldJob.status !== status) {
+    const STATUS_LABELS = {
+      applied: 'Applied', phone_screen: 'Phone Screen', oa: 'Online Assessment',
+      technical: 'Technical Interview', onsite: 'Onsite', offer: 'Offer Received 🎉',
+      rejected: 'Rejected', withdrawn: 'Withdrawn',
+    };
+    logActivity(
+      req.params.id,
+      'status_change',
+      `Status changed from "${STATUS_LABELS[oldJob.status] || oldJob.status}" to "${STATUS_LABELS[status] || status}"`
+    );
+  }
+
+  // Log notes change
+  if (oldJob && oldJob.notes !== notes && notes) {
+    logActivity(req.params.id, 'note', 'Notes updated');
+  }
+
   res.json(db.prepare('SELECT * FROM jobs WHERE id = ?').get(req.params.id));
 });
 
 app.delete('/api/jobs/:id', (req, res) => {
   db.prepare('DELETE FROM jobs WHERE id = ?').run(req.params.id);
   res.json({ success: true });
+});
+
+// ── ACTIVITY LOG ──────────────────────────────────────────────────────────────
+
+app.get('/api/jobs/:id/activity', (req, res) => {
+  const activity = db.prepare(
+    'SELECT * FROM activity_log WHERE job_id = ? ORDER BY created_at DESC'
+  ).all(req.params.id);
+  res.json(activity);
+});
+
+app.post('/api/jobs/:id/activity', (req, res) => {
+  const { type, description } = req.body;
+  const result = db.prepare(
+    'INSERT INTO activity_log (job_id, type, description) VALUES (?, ?, ?)'
+  ).run(req.params.id, type || 'note', description);
+  res.status(201).json(db.prepare('SELECT * FROM activity_log WHERE id = ?').get(result.lastInsertRowid));
 });
 
 // ── CONTACTS ──────────────────────────────────────────────────────────────────
@@ -71,6 +194,8 @@ app.post('/api/jobs/:id/contacts', (req, res) => {
   const result = db.prepare(
     'INSERT INTO contacts (job_id, name, email, phone, role, notes) VALUES (?, ?, ?, ?, ?, ?)'
   ).run(req.params.id, name, email, phone, role, notes);
+
+  logActivity(req.params.id, 'contact', `Contact added: ${name}${role ? ` (${role})` : ''}`);
   res.status(201).json(db.prepare('SELECT * FROM contacts WHERE id = ?').get(result.lastInsertRowid));
 });
 
@@ -94,15 +219,31 @@ app.post('/api/jobs/:id/interviews', (req, res) => {
     INSERT INTO interview_rounds (job_id, round_type, scheduled_date, interviewer, notes, questions_asked, outcome)
     VALUES (?, ?, ?, ?, ?, ?, ?)
   `).run(req.params.id, round_type, scheduled_date, interviewer, notes, questions_asked, outcome);
+
+  const ROUND_LABELS = {
+    hr_screen: 'HR Screen', phone_screen: 'Phone Screen', online_assessment: 'Online Assessment',
+    technical: 'Technical Interview', system_design: 'System Design', behavioral: 'Behavioral',
+    onsite: 'Onsite', other: 'Other',
+  };
+  const label = ROUND_LABELS[round_type] || round_type;
+  const dateStr = scheduled_date ? ` on ${scheduled_date.replace('T', ' ')}` : '';
+  logActivity(req.params.id, 'interview', `${label} round scheduled${dateStr}${interviewer ? ` with ${interviewer}` : ''}`);
+
   res.status(201).json(db.prepare('SELECT * FROM interview_rounds WHERE id = ?').get(result.lastInsertRowid));
 });
 
 app.put('/api/interviews/:id', (req, res) => {
   const { round_type, scheduled_date, interviewer, notes, questions_asked, outcome } = req.body;
+  const old = db.prepare('SELECT * FROM interview_rounds WHERE id = ?').get(req.params.id);
   db.prepare(`
     UPDATE interview_rounds SET round_type=?, scheduled_date=?, interviewer=?, notes=?, questions_asked=?, outcome=?
     WHERE id=?
   `).run(round_type, scheduled_date, interviewer, notes, questions_asked, outcome, req.params.id);
+
+  if (old && outcome && old.outcome !== outcome) {
+    logActivity(old.job_id, 'interview', `Interview outcome updated: ${outcome}`);
+  }
+
   res.json(db.prepare('SELECT * FROM interview_rounds WHERE id = ?').get(req.params.id));
 });
 
@@ -170,7 +311,51 @@ app.get('/api/stats', (req, res) => {
     WHERE ir.scheduled_date >= datetime('now')
     ORDER BY ir.scheduled_date ASC LIMIT 5
   `).all();
-  res.json({ total, byStatus, upcoming, upcomingInterviews });
+
+  // Weekly applications over last 8 weeks
+  const weeklyApps = db.prepare(`
+    SELECT strftime('%Y-W%W', applied_date) as week, COUNT(*) as count
+    FROM jobs
+    WHERE applied_date IS NOT NULL AND applied_date >= date('now', '-56 days')
+    GROUP BY week
+    ORDER BY week ASC
+  `).all();
+
+  // Source breakdown
+  const bySource = db.prepare(`
+    SELECT COALESCE(source, 'Unknown') as source, COUNT(*) as count
+    FROM jobs GROUP BY source ORDER BY count DESC
+  `).all();
+
+  // Average time to response (days between applied_date and first status change)
+  const responseStats = db.prepare(`
+    SELECT COUNT(*) as responded FROM jobs
+    WHERE status NOT IN ('applied', 'withdrawn')
+  `).get();
+
+  res.json({ total, byStatus, upcoming, upcomingInterviews, weeklyApps, bySource, responseStats });
+});
+
+// ── EXPORT ───────────────────────────────────────────────────────────────────
+
+app.get('/api/export/csv', (req, res) => {
+  const jobs = db.prepare('SELECT * FROM jobs ORDER BY created_at DESC').all();
+  const headers = ['id', 'company', 'position', 'location', 'remote', 'url', 'status', 'applied_date', 'deadline', 'salary_min', 'salary_max', 'notes', 'source', 'priority', 'created_at'];
+  const csvRows = [
+    headers.join(','),
+    ...jobs.map(job =>
+      headers.map(h => {
+        const val = job[h];
+        if (val === null || val === undefined) return '';
+        const str = String(val);
+        return str.includes(',') || str.includes('"') || str.includes('\n')
+          ? `"${str.replace(/"/g, '""')}"` : str;
+      }).join(',')
+    )
+  ];
+  res.setHeader('Content-Type', 'text/csv');
+  res.setHeader('Content-Disposition', 'attachment; filename="job-applications.csv"');
+  res.send(csvRows.join('\n'));
 });
 
 app.listen(PORT, () => console.log(`Server running on http://localhost:${PORT}`));
